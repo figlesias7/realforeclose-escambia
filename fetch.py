@@ -80,55 +80,72 @@ def extract_auctions_waiting(text: str) -> str:
     return section
 
 
+
 def parse_waiting_records(section_text: str) -> list[dict]:
     if not section_text:
         return []
 
-    # Split by case blocks so one field mismatch does not kill the whole record.
-    blocks = re.split(r"(?=Case\s*#?:)", section_text, flags=re.IGNORECASE)
     rows = []
 
-    for block in blocks:
-        block = clean_text(block)
-        if not block or "Case #" not in block:
+    # Split by auction-date blocks first so every case under that block inherits the same date
+    auction_blocks = re.split(r"(?=Auction Starts\s*:?)", section_text, flags=re.IGNORECASE)
+
+    for auction_block in auction_blocks:
+        auction_block = auction_block.strip()
+        if not auction_block:
             continue
 
-        def grab(pattern: str, default: str = "") -> str:
-            m = re.search(pattern, block, re.IGNORECASE)
-            return clean_text(m.group(1)) if m else default
-
-        case_no = grab(r"Case\s*#:\s*([A-Za-z0-9\-]+)")
-        if not case_no:
-            continue
-
-        # Flexible date capture: accepts 1- or 2-digit month/day, 2- or 4-digit year,
-        # and optional time / ET suffix.
-        auction_date = grab(
-            r"Auction Starts\s*:?\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4}(?:\s+[0-9]{1,2}:[0-9]{2}\s*[AP]M(?:\s*ET)?)?)"
+        auction_date_match = re.search(
+            r"Auction Starts\s*:?\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4}(?:\s+[0-9]{1,2}:\d{2}\s*[AP]M(?:\s*ET)?)?)",
+            auction_block,
+            re.IGNORECASE,
         )
+        current_auction_date = clean_text(auction_date_match.group(1)) if auction_date_match else ""
 
-        judgment = grab(r"Final Judgment Amount\s*:?\s*(\$[\d,]+\.\d{2}|Hidden)")
-        parcel_id = grab(r"Parcel ID\s*:?\s*([A-Za-z0-9\-\._]+)")
-        address = grab(
-            r"Property Address\s*:?\s*(.*?)(?=Assessed Value:|Plaintiff Max Bid:|Auction Type:|Case #:|Final Judgment Amount:|Parcel ID:|$)"
-        )
-        assessed = grab(r"Assessed Value\s*:?\s*(\$[\d,]+\.\d{2}|Hidden)", "")
-        max_bid = grab(r"Plaintiff Max Bid\s*:?\s*(\$[\d,]+\.\d{2}|Hidden)")
+        # Each case record starts at Case # inside the auction block
+        case_blocks = re.split(r"(?=Case\s*#?:)", auction_block, flags=re.IGNORECASE)
 
-        rows.append({
-            "Auction Date": auction_date,
-            "Property Address": address,
-            "Final Judgment": judgment,
-            "Assessed Value": assessed,
-            "Plaintiff Max Bid": max_bid,
-            "Case #": case_no,
-            "Parcel ID": parcel_id,
-            "Case Link": f"{BASE_DOMAIN}/index.cfm?zaction=auction&zmethod=details&AID={case_no}&bypassPage=1",
-            "Parcel Link": f"https://escpa.org/CAMA/Detail_a.aspx?Key={parcel_id}" if parcel_id else "",
-        })
+        for block in case_blocks:
+            block = clean_text(block)
+            if not block or "Case #" not in block:
+                continue
+
+            def grab(pattern: str, default: str = "") -> str:
+                m = re.search(pattern, block, re.IGNORECASE | re.DOTALL)
+                return clean_text(m.group(1)) if m else default
+
+            # Full case number, not just the first token/year
+            case_no = grab(
+                r"Case\s*#:\s*(.*?)(?=Final Judgment Amount:|Parcel ID:|Property Address:|Assessed Value:|Plaintiff Max Bid:|Auction Starts|$)"
+            )
+            if not case_no:
+                continue
+
+            judgment = grab(r"Final Judgment Amount\s*:?\s*(\$[\d,]+\.\d{2}|Hidden)")
+            parcel_id = grab(r"Parcel ID\s*:?\s*([A-Za-z0-9\-\._]+)")
+            address = grab(
+                r"Property Address\s*:?\s*(.*?)(?=Assessed Value:|Plaintiff Max Bid:|Auction Type:|Case #:|Final Judgment Amount:|Parcel ID:|Auction Starts|$)"
+            )
+            assessed = grab(r"Assessed Value\s*:?\s*(\$[\d,]+\.\d{2}|Hidden)", "")
+            max_bid = grab(r"Plaintiff Max Bid\s*:?\s*(\$[\d,]+\.\d{2}|Hidden)", "")
+
+            # Skip junk/incomplete placeholders unless they at least have a usable address or judgment
+            if not address and judgment in ("", "$0.00") and not assessed and max_bid in ("", "$0.00"):
+                continue
+
+            rows.append({
+                "Auction Date": current_auction_date,
+                "Property Address": address,
+                "Final Judgment": judgment,
+                "Assessed Value": assessed,
+                "Plaintiff Max Bid": max_bid,
+                "Case #": case_no,
+                "Parcel ID": parcel_id,
+                "Case Link": f"{BASE_DOMAIN}/index.cfm?zaction=auction&zmethod=details&AID={case_no}&bypassPage=1",
+                "Parcel Link": f"https://escpa.org/CAMA/Detail_a.aspx?Key={parcel_id}" if parcel_id else "",
+            })
 
     return rows
-
 
 def write_daily(rows: list[dict]) -> None:
     with open(TODAY_FILE, "w", newline="", encoding="utf-8") as f:
@@ -353,7 +370,7 @@ async def scrape():
                     rows = parse_waiting_records(waiting_text)
 
                     if not rows:
-                        print(f"  DEBUG waiting text preview: {waiting_text[:1500]}")
+                        print("  DEBUG waiting text preview:", waiting_text[:2000])
 
                     print(f"  Parsed {len(rows)} waiting records")
 
