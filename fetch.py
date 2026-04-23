@@ -7,7 +7,7 @@ import re
 from datetime import datetime
 from html import escape
 
-BASE_DOMAIN = "https://escambia.realforeclose.com"
+BASE_DOMAIN = "https://escambia.realforeclose.com/"
 CALENDAR_URL = f"{BASE_DOMAIN}/index.cfm?zaction=USER&zmethod=CALENDAR"
 
 DATA_DIR = "data"
@@ -84,37 +84,39 @@ def parse_waiting_records(section_text: str) -> list[dict]:
     if not section_text:
         return []
 
-    # Escambia may look similar to other counties but one strict all-in-one regex can still fail
-    # if a single field is missing, moved, or formatted slightly differently.
-    # So parse block-by-block starting at Case #.
-    blocks = re.split(r"(?=Case\s*#\s*:)", section_text, flags=re.IGNORECASE)
+    # Split safely by Case # so one bad field doesn’t kill everything
+    blocks = re.split(r"(?=Case\s*#?:)", section_text, flags=re.IGNORECASE)
+
     rows = []
 
-    for raw_block in blocks:
-        block = clean_text(raw_block)
+    for block in blocks:
+        block = clean_text(block)
         if not block or "Case #" not in block:
             continue
 
         def grab(pattern: str, default: str = "") -> str:
-            m = re.search(pattern, block, re.IGNORECASE | re.DOTALL)
+            m = re.search(pattern, block, re.IGNORECASE)
             return clean_text(m.group(1)) if m else default
 
-        case_no = grab(r"Case\s*#\s*:\s*([A-Za-z0-9\-]+)")
+        case_no = grab(r"Case\s*#:\s*([A-Za-z0-9\-]+)")
         if not case_no:
             continue
 
+        # Flexible auction date parsing
         auction_date = grab(
             r"Auction Starts\s*:?\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4}(?:\s+[0-9]{1,2}:[0-9]{2}\s*[AP]M(?:\s*ET)?)?)"
         )
+
         judgment = grab(r"Final Judgment Amount\s*:?\s*(\$[\d,]+\.\d{2}|Hidden)")
-        parcel_id = grab(r"Parcel ID\s*:?\s*([A-Za-z0-9\-\._]+)")
+        parcel_id = grab(r"Parcel ID\s*:?\s*([A-Za-z0-9\-\.\_]+)")
+
         address = grab(
-            r"Property Address\s*:?\s*(.*?)(?=Assessed Value\s*:|Plaintiff Max Bid\s*:|Auction Type\s*:|Case\s*#\s*:|Final Judgment Amount\s*:|Parcel ID\s*:|$)"
+            r"Property Address\s*:?\s*(.*?)(?=Assessed Value:|Plaintiff Max Bid:|Auction Type:|Case #:|Final Judgment Amount:|Parcel ID:|$)"
         )
-        assessed = grab(r"Assessed Value\s*:?\s*(\$[\d,]+\.\d{2}|Hidden)")
+
+        assessed = grab(r"Assessed Value\s*:?\s*(\$[\d,]+\.\d{2}|Hidden)", "")
         max_bid = grab(r"Plaintiff Max Bid\s*:?\s*(\$[\d,]+\.\d{2}|Hidden)")
 
-        # Keep rows even if some fields are blank. Case # is the main key.
         rows.append({
             "Auction Date": auction_date,
             "Property Address": address,
@@ -124,11 +126,10 @@ def parse_waiting_records(section_text: str) -> list[dict]:
             "Case #": case_no,
             "Parcel ID": parcel_id,
             "Case Link": f"{BASE_DOMAIN}/index.cfm?zaction=auction&zmethod=details&AID={case_no}&bypassPage=1",
-            "Parcel Link": f"https://escpa.org/CAMA/Detail_a.aspx?Key={parcel_id}" if parcel_id else "",
+            "Parcel Link": f"https://www.sc-pa.com/propertysearch/{parcel_id}" if parcel_id else "",
         })
 
     return rows
-
 
 def write_daily(rows: list[dict]) -> None:
     with open(TODAY_FILE, "w", newline="", encoding="utf-8") as f:
@@ -194,7 +195,7 @@ def build_html(index_files: list[str]) -> None:
                   <td>{escape(r.get("Assessed Value", ""))}</td>
                   <td>{escape(r.get("Plaintiff Max Bid", ""))}</td>
                   <td><a href="{escape(r.get("Case Link", ""))}" target="_blank">{escape(r.get("Case #", ""))}</a></td>
-                  <td>{f'<a href="{escape(r.get("Parcel Link", ""))}" target="_blank">{escape(r.get("Parcel ID", ""))}</a>' if r.get("Parcel Link", "") else escape(r.get("Parcel ID", ""))}</td>
+                  <td><a href="{escape(r.get("Parcel Link", ""))}" target="_blank">{escape(r.get("Parcel ID", ""))}</a></td>
                 </tr>
                 """
                 for r in rows
@@ -352,20 +353,21 @@ async def scrape():
                     waiting_text = extract_auctions_waiting(body_text)
                     rows = parse_waiting_records(waiting_text)
 
-                    if not waiting_text:
-                        print("  DEBUG: could not find Auctions Waiting section")
-                    if not rows:
-                        print("  DEBUG: found waiting section but parsed 0 rows")
-                        print("  DEBUG waiting preview:", waiting_text[:1500].replace("\n", " "))
-
                     print(f"  Parsed {len(rows)} waiting records")
 
                     for r in rows:
                         case_no = r["Case #"]
+                        parcel = r.get("Parcel ID", "")
+                        date = r.get("Auction Date", "")
+                        address = r.get("Property Address", "")
+
+                        # Prevent counties that collapse case numbers from dropping records
+                        unique_key = f"{case_no}|{parcel}|{date}|{address}"
+
                         if not case_no:
                             continue
                         all_rows_for_today.append(r)
-                        seen_cases.add(case_no)
+                        seen_cases.add(unique_key)
 
                 except Exception as e:
                     print(f"skip day {item['day']} error: {e}")
