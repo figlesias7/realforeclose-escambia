@@ -84,9 +84,8 @@ def parse_waiting_records(section_text: str) -> list[dict]:
     if not section_text:
         return []
 
-    # Split safely by Case # so one bad field doesn’t kill everything
+    # Split by case blocks so one field mismatch does not kill the whole record.
     blocks = re.split(r"(?=Case\s*#?:)", section_text, flags=re.IGNORECASE)
-
     rows = []
 
     for block in blocks:
@@ -102,18 +101,17 @@ def parse_waiting_records(section_text: str) -> list[dict]:
         if not case_no:
             continue
 
-        # Flexible auction date parsing
+        # Flexible date capture: accepts 1- or 2-digit month/day, 2- or 4-digit year,
+        # and optional time / ET suffix.
         auction_date = grab(
             r"Auction Starts\s*:?\s*([0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4}(?:\s+[0-9]{1,2}:[0-9]{2}\s*[AP]M(?:\s*ET)?)?)"
         )
 
         judgment = grab(r"Final Judgment Amount\s*:?\s*(\$[\d,]+\.\d{2}|Hidden)")
-        parcel_id = grab(r"Parcel ID\s*:?\s*([A-Za-z0-9\-\.\_]+)")
-
+        parcel_id = grab(r"Parcel ID\s*:?\s*([A-Za-z0-9\-\._]+)")
         address = grab(
             r"Property Address\s*:?\s*(.*?)(?=Assessed Value:|Plaintiff Max Bid:|Auction Type:|Case #:|Final Judgment Amount:|Parcel ID:|$)"
         )
-
         assessed = grab(r"Assessed Value\s*:?\s*(\$[\d,]+\.\d{2}|Hidden)", "")
         max_bid = grab(r"Plaintiff Max Bid\s*:?\s*(\$[\d,]+\.\d{2}|Hidden)")
 
@@ -126,10 +124,11 @@ def parse_waiting_records(section_text: str) -> list[dict]:
             "Case #": case_no,
             "Parcel ID": parcel_id,
             "Case Link": f"{BASE_DOMAIN}/index.cfm?zaction=auction&zmethod=details&AID={case_no}&bypassPage=1",
-            "Parcel Link": f"https://www.sc-pa.com/propertysearch/{parcel_id}" if parcel_id else "",
+            "Parcel Link": f"https://escpa.org/CAMA/Detail_a.aspx?Key={parcel_id}" if parcel_id else "",
         })
 
     return rows
+
 
 def write_daily(rows: list[dict]) -> None:
     with open(TODAY_FILE, "w", newline="", encoding="utf-8") as f:
@@ -353,21 +352,17 @@ async def scrape():
                     waiting_text = extract_auctions_waiting(body_text)
                     rows = parse_waiting_records(waiting_text)
 
+                    if not rows:
+                        print(f"  DEBUG waiting text preview: {waiting_text[:1500]}")
+
                     print(f"  Parsed {len(rows)} waiting records")
 
                     for r in rows:
                         case_no = r["Case #"]
-                        parcel = r.get("Parcel ID", "")
-                        date = r.get("Auction Date", "")
-                        address = r.get("Property Address", "")
-
-                        # Prevent counties that collapse case numbers from dropping records
-                        unique_key = f"{case_no}|{parcel}|{date}|{address}"
-
                         if not case_no:
                             continue
                         all_rows_for_today.append(r)
-                        seen_cases.add(unique_key)
+                        seen_cases.add(case_no)
 
                 except Exception as e:
                     print(f"skip day {item['day']} error: {e}")
